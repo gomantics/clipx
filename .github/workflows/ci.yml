@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         go-version: ["1.25.1"]
@@ -51,7 +51,7 @@ jobs:
         run: go vet ./...
 
       - name: Build
-        run: go build -o clipx ./cmd/clipx
+        run: go build -o clipx-bin ./cmd/clipx
 
       - name: Run tests
         run: go test -v -race -coverprofile=coverage.out ./...

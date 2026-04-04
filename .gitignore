@@ -30,4 +30,4 @@ tmp
 dist/
 
 # Binary
-/clipx
+clipx-bin
