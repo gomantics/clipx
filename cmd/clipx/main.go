@@ -260,6 +260,10 @@ func selfUpdate() {
 	fmt.Println("updating via go install...")
 
 	cmd := exec.Command("go", "install", "github.com/gomantics/clipx/cmd/clipx@latest")
+	cmd.Env = append(os.Environ(),
+		"GONOSUMDB=github.com/gomantics/clipx",
+		"GONOSUMCHECK=github.com/gomantics/clipx",
+	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
