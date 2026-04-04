@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	multicastAddr  = "224.0.0.177:9877"
+	multicastAddr  = "239.77.77.77:9877"
 	tcpPort        = 9878
 	beaconInterval = 2 * time.Second
 	pollInterval   = 500 * time.Millisecond
@@ -259,22 +259,22 @@ func hashContent(data []byte) string {
 // --- UDP Multicast Beacon ---
 
 func (n *Node) startBeacon() {
-	addr, err := net.ResolveUDPAddr("udp4", multicastAddr)
+	dst, err := net.ResolveUDPAddr("udp4", multicastAddr)
 	if err != nil {
 		n.logger.Fatalf("resolve multicast: %v", err)
 	}
 
-	conn, err := net.DialUDP("udp4", nil, addr)
+	// use an unconnected socket — DialUDP to multicast breaks on macOS
+	conn, err := net.ListenPacket("udp4", ":0")
 	if err != nil {
-		n.logger.Fatalf("dial multicast: %v", err)
+		n.logger.Fatalf("listen packet: %v", err)
 	}
 	defer conn.Close()
 
-	// get our TCP listener port
-	msg := fmt.Sprintf("%s|%s|%d", magicHeader, n.id, tcpPort)
+	msg := []byte(fmt.Sprintf("%s|%s|%d", magicHeader, n.id, tcpPort))
 
 	for {
-		_, err := conn.Write([]byte(msg))
+		_, err := conn.WriteTo(msg, dst)
 		if err != nil {
 			n.logger.Printf("beacon send error: %v", err)
 		}
