@@ -1,11 +1,10 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
@@ -21,17 +20,15 @@ import (
 
 	"github.com/google/uuid"
 	"golang.org/x/net/ipv4"
-
-	// needed for SO_REUSEADDR/SO_REUSEPORT on the multicast listener
 	"golang.org/x/sys/unix"
 )
 
+var version = "dev"
+
 func getVersion() string {
-	// ldflags -X main.version takes priority (goreleaser sets this)
 	if version != "dev" && version != "" {
 		return version
 	}
-	// fallback: go install embeds module version in build info
 	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
 		return info.Main.Version
 	}
@@ -39,32 +36,38 @@ func getVersion() string {
 }
 
 const (
+	multicastGroup = "239.77.77.77"
+	multicastPort  = 9877
 	multicastAddr  = "239.77.77.77:9877"
-	tcpPort        = 9878
 	beaconInterval = 2 * time.Second
 	pollInterval   = 500 * time.Millisecond
-	maxClipSize    = 10 * 1024 * 1024 // 10MB
-	magicHeader    = "CLIPX1"
+	maxClipSize    = 64 * 1024 // 64KB — safe for UDP on LAN
+
+	// message types
+	msgBeacon    = "B"
+	msgClipboard = "C"
 )
 
+// wire format (all UDP multicast):
+//   [1 byte type] [8 bytes nodeID] [payload...]
+//
+// beacon payload:  (empty — presence is enough)
+// clipboard payload: [32 bytes sha256 hex hash] [clipboard data]
+
 type Node struct {
-	id       string
-	mu       sync.Mutex
-	lastHash string
-	// tracks hashes we received from peers so we don't re-broadcast them
+	id           string
+	mu           sync.Mutex
+	lastHash     string
 	peerHashes   map[string]time.Time
 	peerHashesMu sync.Mutex
-	peers        map[string]peerInfo
+	peers        map[string]time.Time // nodeID -> lastSeen
 	peersMu      sync.Mutex
+	sender       *ipv4.PacketConn
+	senderConn   net.PacketConn
+	senderMu     sync.Mutex
+	dst          *net.UDPAddr
 	logger       *log.Logger
 }
-
-type peerInfo struct {
-	addr     string
-	lastSeen time.Time
-}
-
-var version = "dev"
 
 func main() {
 	if len(os.Args) > 1 {
@@ -92,10 +95,13 @@ func main() {
 
 	logger := log.New(os.Stdout, "[clipx] ", log.LstdFlags|log.Lmsgprefix)
 
+	dst, _ := net.ResolveUDPAddr("udp4", multicastAddr)
+
 	node := &Node{
 		id:         uuid.New().String()[:8],
 		peerHashes: make(map[string]time.Time),
-		peers:      make(map[string]peerInfo),
+		peers:      make(map[string]time.Time),
+		dst:        dst,
 		logger:     logger,
 	}
 
@@ -106,13 +112,15 @@ func main() {
 		node.lastHash = hashContent(content)
 	}
 
-	go node.startBeacon()
-	go node.listenBeacon()
-	go node.listenTCP()
-	go node.watchClipboard()
-	go node.cleanupPeers()
+	// setup sender (multicast out)
+	node.setupSender()
 
-	// graceful shutdown
+	// start listener, beacon, clipboard watcher
+	go node.listenMulticast()
+	go node.sendBeacons()
+	go node.watchClipboard()
+	go node.maintenance()
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
@@ -132,6 +140,335 @@ Usage:
   clipx help         Show this help
 `, getVersion())
 }
+
+// --- Multicast sender ---
+
+func (n *Node) setupSender() {
+	conn, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		n.logger.Fatalf("sender listen: %v", err)
+	}
+	n.senderConn = conn
+	n.sender = ipv4.NewPacketConn(conn)
+	n.sender.SetMulticastTTL(2)
+	n.sender.SetMulticastLoopback(true)
+	n.bindSenderInterface()
+}
+
+func (n *Node) bindSenderInterface() {
+	if iface := findMulticastInterface(); iface != nil {
+		if err := n.sender.SetMulticastInterface(iface); err != nil {
+			n.logger.Printf("warning: bind sender to %s: %v", iface.Name, err)
+		} else {
+			n.logger.Printf("sender bound to %s", iface.Name)
+		}
+	}
+}
+
+func (n *Node) multicastSend(data []byte) error {
+	n.senderMu.Lock()
+	defer n.senderMu.Unlock()
+	_, err := n.senderConn.WriteTo(data, n.dst)
+	return err
+}
+
+// --- Multicast listener ---
+
+func (n *Node) listenMulticast() {
+	group := net.ParseIP(multicastGroup)
+
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var opErr error
+			c.Control(func(fd uintptr) {
+				opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+				if opErr != nil {
+					return
+				}
+				opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+			})
+			return opErr
+		},
+	}
+
+	conn, err := lc.ListenPacket(context.Background(), "udp4", fmt.Sprintf(":%d", multicastPort))
+	if err != nil {
+		n.logger.Fatalf("listen: %v", err)
+	}
+	defer conn.Close()
+
+	p := ipv4.NewPacketConn(conn)
+
+	joinAll := func() int {
+		joined := 0
+		for _, iface := range multicastInterfaces() {
+			p.LeaveGroup(&iface, &net.UDPAddr{IP: group})
+			if err := p.JoinGroup(&iface, &net.UDPAddr{IP: group}); err != nil {
+				continue
+			}
+			n.logger.Printf("listening on %s", iface.Name)
+			joined++
+		}
+		return joined
+	}
+
+	if joinAll() == 0 {
+		n.logger.Fatal("could not join multicast on any interface")
+	}
+
+	// periodic re-join
+	go func() {
+		for {
+			time.Sleep(30 * time.Second)
+			joinAll()
+		}
+	}()
+
+	p.SetControlMessage(ipv4.FlagDst, true)
+
+	buf := make([]byte, 70*1024) // 64KB data + header overhead
+
+	for {
+		nBytes, cm, _, err := p.ReadFrom(buf)
+		if err != nil {
+			n.logger.Printf("recv error: %v", err)
+			continue
+		}
+
+		if cm != nil && cm.Dst != nil && !cm.Dst.Equal(group) {
+			continue
+		}
+
+		if nBytes < 9 { // 1 type + 8 nodeID minimum
+			continue
+		}
+
+		msgType := string(buf[0:1])
+		nodeID := string(buf[1:9])
+
+		if nodeID == fmt.Sprintf("%-8s", n.id) {
+			continue // ignore self
+		}
+
+		senderID := strings.TrimSpace(nodeID)
+
+		switch msgType {
+		case msgBeacon:
+			n.peersMu.Lock()
+			_, found := n.peers[senderID]
+			if !found {
+				n.logger.Printf("discovered peer %s", senderID)
+			}
+			n.peers[senderID] = time.Now()
+			n.peersMu.Unlock()
+
+		case msgClipboard:
+			if nBytes < 9+64 { // 1 + 8 + 64 hash hex
+				continue
+			}
+			hash := string(buf[9:73])
+			data := make([]byte, nBytes-73)
+			copy(data, buf[73:nBytes])
+
+			n.mu.Lock()
+			if hash == n.lastHash {
+				n.mu.Unlock()
+				continue
+			}
+			n.lastHash = hash
+			n.mu.Unlock()
+
+			n.peerHashesMu.Lock()
+			n.peerHashes[hash] = time.Now()
+			n.peerHashesMu.Unlock()
+
+			if err := writeClipboard(data); err != nil {
+				n.logger.Printf("clipboard write error: %v", err)
+				continue
+			}
+
+			preview := string(data)
+			if len(preview) > 60 {
+				preview = preview[:60] + "..."
+			}
+			preview = strings.ReplaceAll(preview, "\n", "⏎")
+			n.logger.Printf("← from %s (%d bytes): %s", senderID, len(data), preview)
+
+			// also mark this peer as seen
+			n.peersMu.Lock()
+			n.peers[senderID] = time.Now()
+			n.peersMu.Unlock()
+		}
+	}
+}
+
+// --- Beacon sender ---
+
+func (n *Node) sendBeacons() {
+	// build beacon: type + nodeID
+	nodeID := fmt.Sprintf("%-8s", n.id)
+	msg := []byte(msgBeacon + nodeID)
+
+	for {
+		if err := n.multicastSend(msg); err != nil {
+			n.logger.Printf("beacon send error: %v", err)
+			n.bindSenderInterface()
+		}
+		time.Sleep(beaconInterval)
+	}
+}
+
+// --- Clipboard watcher ---
+
+func (n *Node) watchClipboard() {
+	for {
+		time.Sleep(pollInterval)
+
+		data, err := readClipboard()
+		if err != nil || len(data) == 0 {
+			continue
+		}
+
+		if len(data) > maxClipSize {
+			continue
+		}
+
+		hash := hashContent(data)
+
+		n.mu.Lock()
+		if hash == n.lastHash {
+			n.mu.Unlock()
+			continue
+		}
+		n.lastHash = hash
+		n.mu.Unlock()
+
+		// don't broadcast content we just received from a peer
+		n.peerHashesMu.Lock()
+		if _, fromPeer := n.peerHashes[hash]; fromPeer {
+			n.peerHashesMu.Unlock()
+			continue
+		}
+		n.peerHashesMu.Unlock()
+
+		// check we have at least one peer
+		n.peersMu.Lock()
+		peerCount := len(n.peers)
+		n.peersMu.Unlock()
+
+		preview := string(data)
+		if len(preview) > 60 {
+			preview = preview[:60] + "..."
+		}
+		preview = strings.ReplaceAll(preview, "\n", "⏎")
+
+		if peerCount == 0 {
+			n.logger.Printf("→ skipped (%d bytes, no peers): %s", len(data), preview)
+			continue
+		}
+
+		n.logger.Printf("→ sending (%d bytes, %d peers): %s", len(data), peerCount, preview)
+
+		// build clipboard message: type + nodeID + hash + data
+		nodeID := fmt.Sprintf("%-8s", n.id)
+		hashHex := hashContent(data) // 64 hex chars
+		msg := make([]byte, 0, 1+8+64+len(data))
+		msg = append(msg, []byte(msgClipboard)...)
+		msg = append(msg, []byte(nodeID)...)
+		msg = append(msg, []byte(hashHex)...)
+		msg = append(msg, data...)
+
+		// send via multicast — all peers get it at once
+		if err := n.multicastSend(msg); err != nil {
+			n.logger.Printf("send error: %v", err)
+			n.bindSenderInterface()
+		}
+	}
+}
+
+// --- Maintenance ---
+
+func (n *Node) maintenance() {
+	for {
+		time.Sleep(10 * time.Second)
+
+		// cleanup stale peers
+		n.peersMu.Lock()
+		for id, lastSeen := range n.peers {
+			if time.Since(lastSeen) > 10*time.Second {
+				n.logger.Printf("peer %s timed out", id)
+				delete(n.peers, id)
+			}
+		}
+		n.peersMu.Unlock()
+
+		// cleanup old peer hashes
+		n.peerHashesMu.Lock()
+		for h, t := range n.peerHashes {
+			if time.Since(t) > 30*time.Second {
+				delete(n.peerHashes, h)
+			}
+		}
+		n.peerHashesMu.Unlock()
+
+		// periodic sender rebind
+		n.bindSenderInterface()
+	}
+}
+
+// --- Clipboard (macOS native) ---
+
+func readClipboard() ([]byte, error) {
+	cmd := exec.Command("pbpaste")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func writeClipboard(data []byte) error {
+	cmd := exec.Command("pbcopy")
+	cmd.Stdin = strings.NewReader(string(data))
+	return cmd.Run()
+}
+
+func hashContent(data []byte) string {
+	h := sha256.Sum256(data)
+	return hex.EncodeToString(h[:])
+}
+
+// --- Network helpers ---
+
+func findMulticastInterface() *net.Interface {
+	for _, iface := range multicastInterfaces() {
+		return &iface
+	}
+	return nil
+}
+
+func multicastInterfaces() []net.Interface {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var result []net.Interface
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, _ := iface.Addrs()
+		for _, a := range addrs {
+			if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+				result = append(result, iface)
+				break
+			}
+		}
+	}
+	return result
+}
+
+// --- LaunchAgent ---
 
 const launchAgentLabel = "com.gomantics.clipx"
 
@@ -170,7 +507,6 @@ func logFilePath() string {
 }
 
 func installLaunchAgent() {
-	// find our own binary path
 	binPath, err := os.Executable()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: cannot determine binary path: %v\n", err)
@@ -199,18 +535,16 @@ func installLaunchAgent() {
 		os.Exit(1)
 	}
 
-	// unload if already loaded (ignore errors)
 	exec.Command("launchctl", "unload", plistPath).Run()
 
-	// load the agent
 	if err := exec.Command("launchctl", "load", plistPath).Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: launchctl load failed: %v\n", err)
 		os.Exit(1)
 	}
 
 	fmt.Println("✓ clipx installed and started as LaunchAgent")
-	fmt.Printf("  plist: %s\n", plistPath)
-	fmt.Printf("  logs:  %s\n", logPath)
+	fmt.Printf("  plist:  %s\n", plistPath)
+	fmt.Printf("  logs:   %s\n", logPath)
 	fmt.Printf("  binary: %s\n", binPath)
 	fmt.Println("")
 	fmt.Println("clipx will start automatically at login.")
@@ -219,11 +553,8 @@ func installLaunchAgent() {
 
 func uninstallLaunchAgent() {
 	plistPath := launchAgentPath()
-
-	// unload
 	exec.Command("launchctl", "unload", plistPath).Run()
 
-	// remove plist
 	if err := os.Remove(plistPath); err != nil && !os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "error: cannot remove %s: %v\n", plistPath, err)
 		os.Exit(1)
@@ -234,7 +565,6 @@ func uninstallLaunchAgent() {
 }
 
 func showStatus() {
-	// check if the launch agent is loaded
 	out, err := exec.Command("launchctl", "list", launchAgentLabel).Output()
 	if err != nil {
 		fmt.Println("● clipx is not running as a LaunchAgent")
@@ -276,7 +606,6 @@ func selfUpdate() {
 
 	fmt.Println("✓ clipx updated")
 
-	// restart LaunchAgent if installed
 	plistPath := launchAgentPath()
 	if _, err := os.Stat(plistPath); err == nil {
 		fmt.Println("restarting LaunchAgent...")
@@ -286,431 +615,3 @@ func selfUpdate() {
 	}
 }
 
-// --- Clipboard (macOS native via pbcopy/pbpaste) ---
-
-func readClipboard() ([]byte, error) {
-	cmd := exec.Command("pbpaste")
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func writeClipboard(data []byte) error {
-	cmd := exec.Command("pbcopy")
-	cmd.Stdin = strings.NewReader(string(data))
-	return cmd.Run()
-}
-
-func hashContent(data []byte) string {
-	h := sha256.Sum256(data)
-	return hex.EncodeToString(h[:])
-}
-
-// --- UDP Multicast Beacon ---
-
-// findMulticastInterface finds the best network interface for multicast (WiFi or Ethernet).
-func findMulticastInterface() *net.Interface {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return nil
-	}
-	for _, iface := range ifaces {
-		// skip loopback, down, and non-multicast interfaces
-		if iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		if iface.Flags&net.FlagUp == 0 {
-			continue
-		}
-		if iface.Flags&net.FlagMulticast == 0 {
-			continue
-		}
-		// must have a non-loopback IPv4 address
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, a := range addrs {
-			if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() != nil && !ipnet.IP.IsLoopback() {
-				return &iface
-			}
-		}
-	}
-	return nil
-}
-
-func (n *Node) startBeacon() {
-	dst, err := net.ResolveUDPAddr("udp4", multicastAddr)
-	if err != nil {
-		n.logger.Fatalf("resolve multicast: %v", err)
-	}
-
-	conn, err := net.ListenPacket("udp4", ":0")
-	if err != nil {
-		n.logger.Fatalf("listen packet: %v", err)
-	}
-	defer conn.Close()
-
-	p := ipv4.NewPacketConn(conn)
-
-	bindInterface := func() {
-		if iface := findMulticastInterface(); iface != nil {
-			if err := p.SetMulticastInterface(iface); err != nil {
-				n.logger.Printf("warning: set multicast interface: %v", err)
-			} else {
-				n.logger.Printf("multicast send bound to %s", iface.Name)
-			}
-		}
-	}
-
-	bindInterface()
-	p.SetMulticastTTL(2)
-	p.SetMulticastLoopback(true)
-
-	msg := []byte(fmt.Sprintf("%s|%s|%d", magicHeader, n.id, tcpPort))
-	rebindTicker := time.NewTicker(30 * time.Second)
-	defer rebindTicker.Stop()
-
-	for {
-		select {
-		case <-rebindTicker.C:
-			// periodically re-bind in case network changed
-			bindInterface()
-		default:
-		}
-
-		_, err := conn.WriteTo(msg, dst)
-		if err != nil {
-			n.logger.Printf("beacon send error: %v", err)
-			time.Sleep(5 * time.Second)
-			bindInterface()
-			continue
-		}
-		time.Sleep(beaconInterval)
-	}
-}
-
-// multicastInterfaces returns all IPv4-capable, up, multicast, non-loopback interfaces.
-func multicastInterfaces() []net.Interface {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return nil
-	}
-	var result []net.Interface
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		addrs, _ := iface.Addrs()
-		for _, a := range addrs {
-			if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() != nil {
-				result = append(result, iface)
-				break
-			}
-		}
-	}
-	return result
-}
-
-func (n *Node) listenBeacon() {
-	group := net.ParseIP("239.77.77.77")
-
-	// use ListenConfig with SO_REUSEADDR + SO_REUSEPORT for reliable multicast on macOS
-	lc := net.ListenConfig{
-		Control: func(network, address string, c syscall.RawConn) error {
-			var opErr error
-			c.Control(func(fd uintptr) {
-				opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
-				if opErr != nil {
-					return
-				}
-				opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
-			})
-			return opErr
-		},
-	}
-
-	conn, err := lc.ListenPacket(nil, "udp4", ":9877")
-	if err != nil {
-		n.logger.Fatalf("listen multicast: %v", err)
-	}
-	defer conn.Close()
-
-	p := ipv4.NewPacketConn(conn)
-
-	// join multicast group and periodically re-join to handle network changes
-	joinAll := func() int {
-		joined := 0
-		for _, iface := range multicastInterfaces() {
-			// leave first (ignore error — may not be joined)
-			p.LeaveGroup(&iface, &net.UDPAddr{IP: group})
-			if err := p.JoinGroup(&iface, &net.UDPAddr{IP: group}); err != nil {
-				continue
-			}
-			n.logger.Printf("joined multicast on %s", iface.Name)
-			joined++
-		}
-		return joined
-	}
-
-	if joinAll() == 0 {
-		n.logger.Fatal("could not join multicast group on any interface")
-	}
-
-	// periodically re-join to stay fresh (every 30s)
-	go func() {
-		for {
-			time.Sleep(30 * time.Second)
-			joinAll()
-		}
-	}()
-
-	p.SetControlMessage(ipv4.FlagDst, true)
-
-	buf := make([]byte, 1024)
-
-	for {
-		nBytes, cm, src, err := p.ReadFrom(buf)
-		if err != nil {
-			n.logger.Printf("beacon recv error: %v", err)
-			continue
-		}
-
-		// only process packets sent to our multicast group
-		if cm != nil && cm.Dst != nil && !cm.Dst.Equal(group) {
-			continue
-		}
-
-		parts := strings.Split(string(buf[:nBytes]), "|")
-		if len(parts) != 3 || parts[0] != magicHeader {
-			continue
-		}
-
-		peerID := parts[1]
-		if peerID == n.id {
-			continue // ignore self
-		}
-
-		peerPort := parts[2]
-		var srcIP string
-		if udpAddr, ok := src.(*net.UDPAddr); ok {
-			srcIP = udpAddr.IP.String()
-		} else {
-			host, _, _ := net.SplitHostPort(src.String())
-			srcIP = host
-		}
-		peerAddr := fmt.Sprintf("%s:%s", srcIP, peerPort)
-
-		n.peersMu.Lock()
-		_, found := n.peers[peerID]
-		if !found {
-			n.logger.Printf("discovered peer %s at %s", peerID, peerAddr)
-		}
-		n.peers[peerID] = peerInfo{addr: peerAddr, lastSeen: time.Now()}
-		n.peersMu.Unlock()
-	}
-}
-
-func (n *Node) cleanupPeers() {
-	for {
-		time.Sleep(10 * time.Second)
-		n.peersMu.Lock()
-		for id, p := range n.peers {
-			if time.Since(p.lastSeen) > 10*time.Second {
-				n.logger.Printf("peer %s timed out", id)
-				delete(n.peers, id)
-			}
-		}
-		n.peersMu.Unlock()
-
-		// cleanup old peer hashes
-		n.peerHashesMu.Lock()
-		for h, t := range n.peerHashes {
-			if time.Since(t) > 30*time.Second {
-				delete(n.peerHashes, h)
-			}
-		}
-		n.peerHashesMu.Unlock()
-	}
-}
-
-// --- TCP Sync ---
-
-func (n *Node) listenTCP() {
-	ln, err := net.Listen("tcp4", fmt.Sprintf(":%d", tcpPort))
-	if err != nil {
-		n.logger.Fatalf("tcp listen: %v", err)
-	}
-	defer ln.Close()
-	n.logger.Printf("listening on tcp :%d", tcpPort)
-
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			n.logger.Printf("tcp accept: %v", err)
-			continue
-		}
-		go n.handleIncoming(conn)
-	}
-}
-
-func (n *Node) handleIncoming(conn net.Conn) {
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
-
-	// protocol: 6 bytes magic + 8 bytes nodeID + 4 bytes length + data
-	header := make([]byte, 6)
-	if _, err := io.ReadFull(conn, header); err != nil {
-		return
-	}
-	if string(header) != magicHeader {
-		return
-	}
-
-	nodeIDBuf := make([]byte, 8)
-	if _, err := io.ReadFull(conn, nodeIDBuf); err != nil {
-		return
-	}
-	senderID := string(nodeIDBuf)
-
-	if senderID == n.id {
-		return
-	}
-
-	lenBuf := make([]byte, 4)
-	if _, err := io.ReadFull(conn, lenBuf); err != nil {
-		return
-	}
-	dataLen := binary.BigEndian.Uint32(lenBuf)
-
-	if dataLen > maxClipSize {
-		n.logger.Printf("rejected oversized clip from %s (%d bytes)", senderID, dataLen)
-		return
-	}
-
-	data := make([]byte, dataLen)
-	if _, err := io.ReadFull(conn, data); err != nil {
-		return
-	}
-
-	hash := hashContent(data)
-
-	// check if this is the same as our current clipboard
-	n.mu.Lock()
-	if hash == n.lastHash {
-		n.mu.Unlock()
-		return
-	}
-	n.lastHash = hash
-	n.mu.Unlock()
-
-	// remember this hash came from a peer
-	n.peerHashesMu.Lock()
-	n.peerHashes[hash] = time.Now()
-	n.peerHashesMu.Unlock()
-
-	if err := writeClipboard(data); err != nil {
-		n.logger.Printf("clipboard write error: %v", err)
-		return
-	}
-
-	preview := string(data)
-	if len(preview) > 60 {
-		preview = preview[:60] + "..."
-	}
-	preview = strings.ReplaceAll(preview, "\n", "⏎")
-	n.logger.Printf("← recv from %s (%d bytes): %s", senderID, dataLen, preview)
-}
-
-func (n *Node) sendToPeer(addr string, data []byte) error {
-	conn, err := net.DialTimeout("tcp4", addr, 2*time.Second)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
-
-	// write magic
-	if _, err := conn.Write([]byte(magicHeader)); err != nil {
-		return err
-	}
-
-	// write our node ID (padded/truncated to 8 bytes)
-	nodeID := fmt.Sprintf("%-8s", n.id)
-	if _, err := conn.Write([]byte(nodeID[:8])); err != nil {
-		return err
-	}
-
-	// write length + data
-	lenBuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
-	if _, err := conn.Write(lenBuf); err != nil {
-		return err
-	}
-	if _, err := conn.Write(data); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// --- Clipboard Watcher ---
-
-func (n *Node) watchClipboard() {
-	for {
-		time.Sleep(pollInterval)
-
-		data, err := readClipboard()
-		if err != nil || len(data) == 0 {
-			continue
-		}
-
-		if len(data) > maxClipSize {
-			continue
-		}
-
-		hash := hashContent(data)
-
-		n.mu.Lock()
-		if hash == n.lastHash {
-			n.mu.Unlock()
-			continue
-		}
-		n.lastHash = hash
-		n.mu.Unlock()
-
-		// don't broadcast content we just received from a peer
-		n.peerHashesMu.Lock()
-		if _, fromPeer := n.peerHashes[hash]; fromPeer {
-			n.peerHashesMu.Unlock()
-			continue
-		}
-		n.peerHashesMu.Unlock()
-
-		preview := string(data)
-		if len(preview) > 60 {
-			preview = preview[:60] + "..."
-		}
-		preview = strings.ReplaceAll(preview, "\n", "⏎")
-		n.logger.Printf("→ broadcasting (%d bytes): %s", len(data), preview)
-
-		n.peersMu.Lock()
-		peers := make(map[string]peerInfo)
-		for k, v := range n.peers {
-			peers[k] = v
-		}
-		n.peersMu.Unlock()
-
-		for peerID, peer := range peers {
-			if err := n.sendToPeer(peer.addr, data); err != nil {
-				n.logger.Printf("send to %s failed: %v", peerID, err)
-				// remove unreachable peer — it'll be re-discovered via beacon
-				n.peersMu.Lock()
-				delete(n.peers, peerID)
-				n.peersMu.Unlock()
-			}
-		}
-	}
-}
