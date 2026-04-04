@@ -625,12 +625,12 @@ func (n *Node) handleIncoming(conn net.Conn) {
 }
 
 func (n *Node) sendToPeer(addr string, data []byte) error {
-	conn, err := net.DialTimeout("tcp4", addr, 3*time.Second)
+	conn, err := net.DialTimeout("tcp4", addr, 2*time.Second)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	// write magic
 	if _, err := conn.Write([]byte(magicHeader)); err != nil {
@@ -706,6 +706,10 @@ func (n *Node) watchClipboard() {
 		for peerID, peer := range peers {
 			if err := n.sendToPeer(peer.addr, data); err != nil {
 				n.logger.Printf("send to %s failed: %v", peerID, err)
+				// remove unreachable peer — it'll be re-discovered via beacon
+				n.peersMu.Lock()
+				delete(n.peers, peerID)
+				n.peersMu.Unlock()
 			}
 		}
 	}
