@@ -21,6 +21,9 @@ import (
 
 	"github.com/google/uuid"
 	"golang.org/x/net/ipv4"
+
+	// needed for SO_REUSEADDR/SO_REUSEPORT on the multicast listener
+	"golang.org/x/sys/unix"
 )
 
 func getVersion() string {
@@ -352,39 +355,84 @@ func (n *Node) startBeacon() {
 
 	p := ipv4.NewPacketConn(conn)
 
-	// bind to the right network interface so macOS knows where to send
-	iface := findMulticastInterface()
-	if iface != nil {
-		if err := p.SetMulticastInterface(iface); err != nil {
-			n.logger.Printf("warning: set multicast interface: %v", err)
-		} else {
-			n.logger.Printf("multicast bound to interface %s", iface.Name)
+	bindInterface := func() {
+		if iface := findMulticastInterface(); iface != nil {
+			if err := p.SetMulticastInterface(iface); err != nil {
+				n.logger.Printf("warning: set multicast interface: %v", err)
+			} else {
+				n.logger.Printf("multicast send bound to %s", iface.Name)
+			}
 		}
 	}
+
+	bindInterface()
 	p.SetMulticastTTL(2)
 	p.SetMulticastLoopback(true)
 
 	msg := []byte(fmt.Sprintf("%s|%s|%d", magicHeader, n.id, tcpPort))
+	rebindTicker := time.NewTicker(30 * time.Second)
+	defer rebindTicker.Stop()
 
 	for {
+		select {
+		case <-rebindTicker.C:
+			// periodically re-bind in case network changed
+			bindInterface()
+		default:
+		}
+
 		_, err := conn.WriteTo(msg, dst)
 		if err != nil {
 			n.logger.Printf("beacon send error: %v", err)
-			// interface may have changed (WiFi reconnect etc), retry
 			time.Sleep(5 * time.Second)
-			if iface := findMulticastInterface(); iface != nil {
-				p.SetMulticastInterface(iface)
-				n.logger.Printf("multicast re-bound to interface %s", iface.Name)
-			}
+			bindInterface()
 			continue
 		}
 		time.Sleep(beaconInterval)
 	}
 }
 
+// multicastInterfaces returns all IPv4-capable, up, multicast, non-loopback interfaces.
+func multicastInterfaces() []net.Interface {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var result []net.Interface
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, _ := iface.Addrs()
+		for _, a := range addrs {
+			if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+				result = append(result, iface)
+				break
+			}
+		}
+	}
+	return result
+}
+
 func (n *Node) listenBeacon() {
-	// listen on the multicast port
-	conn, err := net.ListenPacket("udp4", fmt.Sprintf(":%d", 9877))
+	group := net.ParseIP("239.77.77.77")
+
+	// use ListenConfig with SO_REUSEADDR + SO_REUSEPORT for reliable multicast on macOS
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var opErr error
+			c.Control(func(fd uintptr) {
+				opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+				if opErr != nil {
+					return
+				}
+				opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+			})
+			return opErr
+		},
+	}
+
+	conn, err := lc.ListenPacket(nil, "udp4", ":9877")
 	if err != nil {
 		n.logger.Fatalf("listen multicast: %v", err)
 	}
@@ -392,40 +440,33 @@ func (n *Node) listenBeacon() {
 
 	p := ipv4.NewPacketConn(conn)
 
-	group := net.ParseIP("239.77.77.77")
-
-	// join multicast group on all suitable interfaces
-	ifaces, _ := net.Interfaces()
-	joined := 0
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		// check if interface has an IPv4 address
-		addrs, _ := iface.Addrs()
-		hasIPv4 := false
-		for _, a := range addrs {
-			if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() != nil {
-				hasIPv4 = true
-				break
+	// join multicast group and periodically re-join to handle network changes
+	joinAll := func() int {
+		joined := 0
+		for _, iface := range multicastInterfaces() {
+			// leave first (ignore error — may not be joined)
+			p.LeaveGroup(&iface, &net.UDPAddr{IP: group})
+			if err := p.JoinGroup(&iface, &net.UDPAddr{IP: group}); err != nil {
+				continue
 			}
+			n.logger.Printf("joined multicast on %s", iface.Name)
+			joined++
 		}
-		if !hasIPv4 {
-			continue
-		}
-		if err := p.JoinGroup(&iface, &net.UDPAddr{IP: group}); err != nil {
-			n.logger.Printf("join multicast on %s: %v", iface.Name, err)
-			continue
-		}
-		n.logger.Printf("joined multicast group on %s", iface.Name)
-		joined++
+		return joined
 	}
 
-	if joined == 0 {
+	if joinAll() == 0 {
 		n.logger.Fatal("could not join multicast group on any interface")
 	}
 
-	// allow reading the destination address to filter
+	// periodically re-join to stay fresh (every 30s)
+	go func() {
+		for {
+			time.Sleep(30 * time.Second)
+			joinAll()
+		}
+	}()
+
 	p.SetControlMessage(ipv4.FlagDst, true)
 
 	buf := make([]byte, 1024)
@@ -453,12 +494,10 @@ func (n *Node) listenBeacon() {
 		}
 
 		peerPort := parts[2]
-		// extract IP from src (which is net.Addr, typically *net.UDPAddr)
 		var srcIP string
 		if udpAddr, ok := src.(*net.UDPAddr); ok {
 			srcIP = udpAddr.IP.String()
 		} else {
-			// parse from string "ip:port"
 			host, _, _ := net.SplitHostPort(src.String())
 			srcIP = host
 		}
