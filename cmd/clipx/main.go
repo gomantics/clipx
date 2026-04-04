@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/net/ipv4"
 )
 
 func getVersion() string {
@@ -302,18 +303,62 @@ func hashContent(data []byte) string {
 
 // --- UDP Multicast Beacon ---
 
+// findMulticastInterface finds the best network interface for multicast (WiFi or Ethernet).
+func findMulticastInterface() *net.Interface {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	for _, iface := range ifaces {
+		// skip loopback, down, and non-multicast interfaces
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		if iface.Flags&net.FlagMulticast == 0 {
+			continue
+		}
+		// must have a non-loopback IPv4 address
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() != nil && !ipnet.IP.IsLoopback() {
+				return &iface
+			}
+		}
+	}
+	return nil
+}
+
 func (n *Node) startBeacon() {
 	dst, err := net.ResolveUDPAddr("udp4", multicastAddr)
 	if err != nil {
 		n.logger.Fatalf("resolve multicast: %v", err)
 	}
 
-	// use an unconnected socket — DialUDP to multicast breaks on macOS
 	conn, err := net.ListenPacket("udp4", ":0")
 	if err != nil {
 		n.logger.Fatalf("listen packet: %v", err)
 	}
 	defer conn.Close()
+
+	p := ipv4.NewPacketConn(conn)
+
+	// bind to the right network interface so macOS knows where to send
+	iface := findMulticastInterface()
+	if iface != nil {
+		if err := p.SetMulticastInterface(iface); err != nil {
+			n.logger.Printf("warning: set multicast interface: %v", err)
+		} else {
+			n.logger.Printf("multicast bound to interface %s", iface.Name)
+		}
+	}
+	p.SetMulticastTTL(2)
+	p.SetMulticastLoopback(true)
 
 	msg := []byte(fmt.Sprintf("%s|%s|%d", magicHeader, n.id, tcpPort))
 
@@ -321,30 +366,75 @@ func (n *Node) startBeacon() {
 		_, err := conn.WriteTo(msg, dst)
 		if err != nil {
 			n.logger.Printf("beacon send error: %v", err)
+			// interface may have changed (WiFi reconnect etc), retry
+			time.Sleep(5 * time.Second)
+			if iface := findMulticastInterface(); iface != nil {
+				p.SetMulticastInterface(iface)
+				n.logger.Printf("multicast re-bound to interface %s", iface.Name)
+			}
+			continue
 		}
 		time.Sleep(beaconInterval)
 	}
 }
 
 func (n *Node) listenBeacon() {
-	addr, err := net.ResolveUDPAddr("udp4", multicastAddr)
-	if err != nil {
-		n.logger.Fatalf("resolve multicast: %v", err)
-	}
-
-	conn, err := net.ListenMulticastUDP("udp4", nil, addr)
+	// listen on the multicast port
+	conn, err := net.ListenPacket("udp4", fmt.Sprintf(":%d", 9877))
 	if err != nil {
 		n.logger.Fatalf("listen multicast: %v", err)
 	}
 	defer conn.Close()
 
-	conn.SetReadBuffer(1024)
+	p := ipv4.NewPacketConn(conn)
+
+	group := net.ParseIP("239.77.77.77")
+
+	// join multicast group on all suitable interfaces
+	ifaces, _ := net.Interfaces()
+	joined := 0
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		// check if interface has an IPv4 address
+		addrs, _ := iface.Addrs()
+		hasIPv4 := false
+		for _, a := range addrs {
+			if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+				hasIPv4 = true
+				break
+			}
+		}
+		if !hasIPv4 {
+			continue
+		}
+		if err := p.JoinGroup(&iface, &net.UDPAddr{IP: group}); err != nil {
+			n.logger.Printf("join multicast on %s: %v", iface.Name, err)
+			continue
+		}
+		n.logger.Printf("joined multicast group on %s", iface.Name)
+		joined++
+	}
+
+	if joined == 0 {
+		n.logger.Fatal("could not join multicast group on any interface")
+	}
+
+	// allow reading the destination address to filter
+	p.SetControlMessage(ipv4.FlagDst, true)
+
 	buf := make([]byte, 1024)
 
 	for {
-		nBytes, src, err := conn.ReadFromUDP(buf)
+		nBytes, cm, src, err := p.ReadFrom(buf)
 		if err != nil {
 			n.logger.Printf("beacon recv error: %v", err)
+			continue
+		}
+
+		// only process packets sent to our multicast group
+		if cm != nil && cm.Dst != nil && !cm.Dst.Equal(group) {
 			continue
 		}
 
@@ -359,14 +449,22 @@ func (n *Node) listenBeacon() {
 		}
 
 		peerPort := parts[2]
-		peerAddr := fmt.Sprintf("%s:%s", src.IP.String(), peerPort)
+		// extract IP from src (which is net.Addr, typically *net.UDPAddr)
+		var srcIP string
+		if udpAddr, ok := src.(*net.UDPAddr); ok {
+			srcIP = udpAddr.IP.String()
+		} else {
+			// parse from string "ip:port"
+			host, _, _ := net.SplitHostPort(src.String())
+			srcIP = host
+		}
+		peerAddr := fmt.Sprintf("%s:%s", srcIP, peerPort)
 
 		n.peersMu.Lock()
-		existing, found := n.peers[peerID]
+		_, found := n.peers[peerID]
 		if !found {
 			n.logger.Printf("discovered peer %s at %s", peerID, peerAddr)
 		}
-		_ = existing
 		n.peers[peerID] = peerInfo{addr: peerAddr, lastSeen: time.Now()}
 		n.peersMu.Unlock()
 	}
