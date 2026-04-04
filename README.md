@@ -126,6 +126,7 @@ defaults delete ~/Library/Preferences/ByHost/com.apple.coreservices.useractivity
 | `clipx install` | Install as macOS LaunchAgent (auto-start at login) |
 | `clipx uninstall` | Remove the LaunchAgent |
 | `clipx status` | Show running status and recent logs |
+| `clipx update` | Self-update to the latest release via `go install` |
 | `clipx version` | Print version |
 | `clipx help` | Show help |
 

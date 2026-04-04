@@ -77,6 +77,9 @@ func main() {
 		case "status":
 			showStatus()
 			return
+		case "update", "self-update":
+			selfUpdate()
+			return
 		case "help", "--help", "-h":
 			printUsage()
 			return
@@ -120,6 +123,7 @@ Usage:
   clipx install      Install as macOS LaunchAgent (starts at login)
   clipx uninstall    Remove the LaunchAgent
   clipx status       Show running status and peers
+  clipx update       Self-update to the latest release
   clipx version      Print version
   clipx help         Show this help
 `, getVersion())
@@ -244,6 +248,33 @@ func showStatus() {
 		fmt.Print(string(tail))
 	} else {
 		fmt.Println("  (no logs yet)")
+	}
+}
+
+// --- Self-update ---
+
+func selfUpdate() {
+	current := getVersion()
+	fmt.Printf("current version: %s\n", current)
+	fmt.Println("updating via go install...")
+
+	cmd := exec.Command("go", "install", "github.com/gomantics/clipx/cmd/clipx@latest")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: go install failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("✓ clipx updated")
+
+	// restart LaunchAgent if installed
+	plistPath := launchAgentPath()
+	if _, err := os.Stat(plistPath); err == nil {
+		fmt.Println("restarting LaunchAgent...")
+		exec.Command("launchctl", "unload", plistPath).Run()
+		exec.Command("launchctl", "load", plistPath).Run()
+		fmt.Println("✓ LaunchAgent restarted")
 	}
 }
 
