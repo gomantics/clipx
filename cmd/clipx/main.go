@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -20,6 +21,18 @@ import (
 
 	"github.com/google/uuid"
 )
+
+func getVersion() string {
+	// ldflags -X main.version takes priority (goreleaser sets this)
+	if version != "dev" && version != "" {
+		return version
+	}
+	// fallback: go install embeds module version in build info
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return "dev"
+}
 
 const (
 	multicastAddr  = "239.77.77.77:9877"
@@ -53,7 +66,7 @@ func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "version", "--version", "-v":
-			fmt.Printf("clipx %s\n", version)
+			fmt.Printf("clipx %s\n", getVersion())
 			return
 		case "install":
 			installLaunchAgent()
@@ -79,7 +92,7 @@ func main() {
 		logger:     logger,
 	}
 
-	logger.Printf("starting clipx %s node=%s", version, node.id)
+	logger.Printf("starting clipx %s node=%s", getVersion(), node.id)
 
 	// initialize lastHash with current clipboard content
 	if content, err := readClipboard(); err == nil && len(content) > 0 {
@@ -109,7 +122,7 @@ Usage:
   clipx status       Show running status and peers
   clipx version      Print version
   clipx help         Show this help
-`, version)
+`, getVersion())
 }
 
 const launchAgentLabel = "com.gomantics.clipx"
