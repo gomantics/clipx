@@ -200,9 +200,8 @@ func (n *Node) watchClipboard() {
 
 		msg := encodeMessage(msgClip, n.id, encodeClipPayload(data))
 		for _, peer := range n.peers {
-			target := fmt.Sprintf("%s:%d", peer, DefaultPort)
-			if _, err := n.conn.WriteTo(msg, &net.UDPAddr{IP: net.ParseIP(peer), Port: DefaultPort}); err != nil {
-				n.logger.Printf("send to %s failed: %v", target, err)
+			if err := sendUDP(peer, msg); err != nil {
+				n.logger.Printf("send to %s failed: %v", peer, err)
 			}
 		}
 	}
@@ -231,6 +230,20 @@ func (n *Node) heartbeat() {
 }
 
 // --- Helpers ---
+
+// sendUDP sends data to a peer via a fresh UDP connection.
+// Using Dial lets the OS pick the right interface/route.
+func sendUDP(peer string, data []byte) error {
+	addr := net.JoinHostPort(peer, fmt.Sprintf("%d", DefaultPort))
+	conn, err := net.DialTimeout("udp4", addr, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_, err = conn.Write(data)
+	return err
+}
 
 func clipPreview(data []byte) string {
 	s := string(data)
