@@ -22,14 +22,14 @@ make coverage   # generate HTML coverage report
 ### Project structure
 
 ```
-cmd/clipx/         CLI entry point (commands, LaunchAgent management)
-clipx/
-  clipboard.go     Clipboard abstraction (pbcopy/pbpaste)
-  config.go        Config file (~/.config/clipx/config.json)
-  net.go           Network utilities (DNS resolution, ping)
-  node.go          Core daemon (listener, clipboard watcher, peer sync)
-  protocol.go      Wire protocol (encode/decode messages & chunks)
-  *_test.go        Tests
+cmd/clipx/              CLI entry point (commands, LaunchAgent management)
+internal/clipx/
+  clipboard.go          Clipboard abstraction (pbcopy/pbpaste)
+  config.go             Config file (~/.config/clipx/config.json)
+  net.go                Network utilities (DNS resolution, ping)
+  node.go               Core daemon (listener, clipboard watcher, peer sync)
+  protocol.go           Wire protocol (encode/decode messages & chunks)
+  *_test.go             Tests
 ```
 
 ### Running locally

@@ -13,7 +13,7 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/gomantics/clipx/clipx"
+	"github.com/gomantics/clipx/internal/clipx"
 )
 
 var version = "dev"
