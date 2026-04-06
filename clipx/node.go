@@ -22,11 +22,11 @@ type Node struct {
 	peers     []string // peer IPs
 	clipboard Clipboard
 	logger    *log.Logger
-	conn      net.PacketConn     // listener
+	conn      net.PacketConn      // listener
 	peerConns map[string]net.Conn // persistent send connections per peer
 
-	mu           sync.Mutex
-	lastHash     string // last clipboard hash we've seen (sent or received)
+	mu       sync.Mutex
+	lastHash string // last clipboard hash we've seen (sent or received)
 
 	// hashes received from peers — prevents re-broadcasting
 	peerHashes   map[string]time.Time
