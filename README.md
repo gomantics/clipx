@@ -12,13 +12,13 @@ No cloud. No account. No Apple ID. No flaky Universal Clipboard.
 ## How it works
 
 ```
-  ┌──────────────────┐                    ┌──────────────────┐
-  │     MacBook       │   UDP :9877        │     iMac          │
-  │                    │ ────────────────► │                    │
-  │  clipx             │                    │  clipx             │
-  │  192.168.0.5       │ ◄──────────────── │  192.168.0.6       │
-  └──────────────────┘                    └──────────────────┘
-         copy ⌘C                               paste ⌘V
+  ┌──────────────────┐                  ┌──────────────────┐
+  │  MacBook         │    UDP :9877     │  iMac            │
+  │                  │ ──────────────►  │                  │
+  │  clipx           │                  │  clipx           │
+  │  192.168.0.5     │ ◄──────────────  │  192.168.0.6     │
+  └──────────────────┘                  └──────────────────┘
+       copy ⌘C                             paste ⌘V
 ```
 
 Each Mac runs `clipx`. When you copy something, it sends the clipboard content directly to all paired peers via UDP unicast. When it receives content from a peer, it writes it to your local clipboard. That's it.
