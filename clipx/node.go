@@ -21,7 +21,8 @@ type Node struct {
 	peers     []string // peer IPs
 	clipboard Clipboard
 	logger    *log.Logger
-	conn      net.PacketConn
+	conn      net.PacketConn     // listener
+	peerConns map[string]net.Conn // persistent send connections per peer
 
 	mu           sync.Mutex
 	lastHash     string // last clipboard hash we've seen (sent or received)
@@ -64,14 +65,19 @@ func NewNodeWithClipboard(cfg *Config, logger *log.Logger, cb Clipboard) (*Node,
 		clipboard:  cb,
 		logger:     logger,
 		conn:       conn,
+		peerConns:  make(map[string]net.Conn),
 		peerHashes: make(map[string]time.Time),
 		chunks:     make(map[string]*chunkBuffer),
 		stopCh:     make(chan struct{}),
 	}
 
-	// initialize with current clipboard
 	if content, err := cb.Read(); err == nil && len(content) > 0 {
 		n.lastHash = HashContent(content)
+	}
+
+	// establish persistent connections to peers
+	for _, peer := range cfg.Peers {
+		n.connectPeer(peer)
 	}
 
 	return n, nil
@@ -89,7 +95,45 @@ func (n *Node) Start() {
 func (n *Node) Stop() {
 	close(n.stopCh)
 	n.conn.Close()
+	for _, c := range n.peerConns {
+		c.Close()
+	}
 	n.wg.Wait()
+}
+
+func (n *Node) connectPeer(peer string) {
+	addr := net.JoinHostPort(peer, fmt.Sprintf("%d", DefaultPort))
+	conn, err := net.Dial("udp4", addr)
+	if err != nil {
+		n.logger.Printf("connect %s: %v", peer, err)
+		return
+	}
+	n.peerConns[peer] = conn
+	n.logger.Printf("connected to %s", peer)
+}
+
+func (n *Node) sendToPeer(peer string, data []byte) error {
+	conn, ok := n.peerConns[peer]
+	if !ok {
+		n.connectPeer(peer)
+		conn = n.peerConns[peer]
+		if conn == nil {
+			return fmt.Errorf("cannot connect to %s", peer)
+		}
+	}
+	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_, err := conn.Write(data)
+	if err != nil {
+		// reconnect and retry once
+		conn.Close()
+		delete(n.peerConns, peer)
+		n.connectPeer(peer)
+		if c, ok := n.peerConns[peer]; ok {
+			c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			_, err = c.Write(data)
+		}
+	}
+	return err
 }
 
 // --- Listener ---
@@ -280,7 +324,7 @@ func (n *Node) sendToAllPeers(data []byte) {
 		msg := encodeMessage(msgClip, n.id, encodeClipPayload(data))
 		for attempt := 0; attempt < 3; attempt++ {
 			for _, peer := range n.peers {
-				if err := sendUDP(peer, msg); err != nil {
+				if err := n.sendToPeer(peer, msg); err != nil {
 					n.logger.Printf("send to %s failed: %v", peer, err)
 				}
 			}
@@ -309,7 +353,7 @@ func (n *Node) sendToAllPeers(data []byte) {
 		msg := encodeMessage(msgChunk, n.id, payload)
 
 		for _, peer := range n.peers {
-			if err := sendUDP(peer, msg); err != nil {
+			if err := n.sendToPeer(peer, msg); err != nil {
 				n.logger.Printf("send chunk %d/%d to %s failed: %v", i+1, totalChunks, peer, err)
 			}
 		}
@@ -355,20 +399,6 @@ func (n *Node) maintenance() {
 }
 
 // --- Helpers ---
-
-// sendUDP sends data to a peer via a fresh UDP connection.
-// Using Dial lets the OS pick the right interface/route.
-func sendUDP(peer string, data []byte) error {
-	addr := net.JoinHostPort(peer, fmt.Sprintf("%d", DefaultPort))
-	conn, err := net.DialTimeout("udp4", addr, 2*time.Second)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	_, err = conn.Write(data)
-	return err
-}
 
 func clipPreview(data []byte) string {
 	s := string(data)
