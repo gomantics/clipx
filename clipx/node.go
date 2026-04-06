@@ -15,7 +15,8 @@ const (
 	pollInterval = 500 * time.Millisecond
 )
 
-// Node is a clipx daemon instance.
+// Node is a clipx daemon instance that watches the local clipboard,
+// broadcasts changes to peers, and applies incoming clipboard content.
 type Node struct {
 	id        string
 	peers     []string // peer IPs
@@ -47,7 +48,7 @@ type chunkBuffer struct {
 	createdAt time.Time
 }
 
-// NewNode creates a new clipx node.
+// NewNode creates a new clipx node using the macOS system clipboard.
 func NewNode(cfg *Config, logger *log.Logger) (*Node, error) {
 	return NewNodeWithClipboard(cfg, logger, &MacClipboard{})
 }
@@ -83,7 +84,9 @@ func NewNodeWithClipboard(cfg *Config, logger *log.Logger, cb Clipboard) (*Node,
 	return n, nil
 }
 
-// Start begins the listener, clipboard watcher, and maintenance.
+// Start launches three background goroutines: the UDP listener,
+// the clipboard poller, and the maintenance loop. Call [Node.Stop]
+// to shut down gracefully.
 func (n *Node) Start() {
 	n.wg.Add(3)
 	go n.listen()
@@ -91,7 +94,8 @@ func (n *Node) Start() {
 	go n.maintenance()
 }
 
-// Stop shuts down the node.
+// Stop gracefully shuts down the node, closing all connections
+// and waiting for goroutines to exit.
 func (n *Node) Stop() {
 	close(n.stopCh)
 	n.conn.Close()

@@ -1,3 +1,8 @@
+// Package clipx implements LAN clipboard sync for macOS.
+//
+// It uses UDP unicast to send clipboard content between explicitly
+// paired peers on the same local network. Content is deduplicated
+// via SHA-256 hashing to prevent infinite ping-pong loops.
 package clipx
 
 import (
@@ -7,13 +12,17 @@ import (
 	"strings"
 )
 
-// Clipboard abstracts clipboard read/write for testability.
+// Clipboard abstracts clipboard read/write operations.
+// Implementations must be safe for concurrent use.
 type Clipboard interface {
+	// Read returns the current clipboard content.
 	Read() ([]byte, error)
+	// Write sets the clipboard content.
 	Write(data []byte) error
 }
 
-// MacClipboard uses pbcopy/pbpaste.
+// MacClipboard reads and writes the macOS system clipboard
+// using pbcopy and pbpaste.
 type MacClipboard struct{}
 
 // utf8Env returns the current environment with LANG forced to UTF-8.

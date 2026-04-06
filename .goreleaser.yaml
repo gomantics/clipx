@@ -63,6 +63,19 @@ changelog:
     - title: Others
       order: 999
 
+brews:
+  - repository:
+      owner: gomantics
+      name: homebrew-tap
+    directory: Formula
+    homepage: "https://github.com/gomantics/clipx"
+    description: "LAN clipboard sync for macOS. Copy on one Mac, paste on another."
+    license: "MIT"
+    install: |
+      bin.install "clipx"
+    test: |
+      system "#{bin}/clipx", "version"
+
 release:
   github:
     owner: gomantics
@@ -76,7 +89,10 @@ release:
     ### Installation
     
     ```bash
-    # Using Go
+    # Homebrew
+    brew install gomantics/tap/clipx
+    
+    # Go
     go install github.com/gomantics/clipx/cmd/clipx@{{ .Tag }}
     
     # Or download the binary from the assets above
