@@ -24,9 +24,7 @@ type Node struct {
 	conn      net.PacketConn
 
 	mu           sync.Mutex
-	lastRecvHash string // last hash received from peer (for anti-loop)
-	lastSentHash string // last hash we sent (to avoid resending same content every poll)
-	lastSentAt   time.Time
+	lastHash     string // last clipboard hash we've seen (sent or received)
 
 	// hashes received from peers — prevents re-broadcasting
 	peerHashes   map[string]time.Time
@@ -73,9 +71,7 @@ func NewNodeWithClipboard(cfg *Config, logger *log.Logger, cb Clipboard) (*Node,
 
 	// initialize with current clipboard
 	if content, err := cb.Read(); err == nil && len(content) > 0 {
-		h := HashContent(content)
-		n.lastRecvHash = h
-		n.lastSentHash = h
+		n.lastHash = HashContent(content)
 	}
 
 	return n, nil
@@ -209,12 +205,11 @@ func (n *Node) handleChunk(senderID string, payload []byte) {
 
 func (n *Node) applyClipboard(senderID, hash string, data []byte) {
 	n.mu.Lock()
-	if hash == n.lastRecvHash {
+	if hash == n.lastHash {
 		n.mu.Unlock()
 		return
 	}
-	n.lastRecvHash = hash
-	n.lastSentHash = hash // also set sent hash so we don't echo it back
+	n.lastHash = hash
 	n.mu.Unlock()
 
 	n.peerHashesMu.Lock()
@@ -257,13 +252,13 @@ func (n *Node) watchClipboard() {
 		}
 		n.peerHashesMu.Unlock()
 
-		// skip if same as what we last sent AND sent recently (< 5s)
-		// after 5s, allow re-send of same content (retry for UDP drops)
+		// only send when clipboard content actually changes
 		n.mu.Lock()
-		if hash == n.lastSentHash && time.Since(n.lastSentAt) < 5*time.Second {
+		if hash == n.lastHash {
 			n.mu.Unlock()
 			continue
 		}
+		n.lastHash = hash
 		n.mu.Unlock()
 
 		if len(n.peers) == 0 {
@@ -280,18 +275,17 @@ func (n *Node) watchClipboard() {
 func (n *Node) sendToAllPeers(data []byte) {
 	hash := HashContent(data)
 
-	// record that we sent this
-	n.mu.Lock()
-	n.lastSentHash = hash
-	n.lastSentAt = time.Now()
-	n.mu.Unlock()
-
 	if len(data) <= MaxChunkPayload {
-		// single packet
+		// single packet — send 3 times for UDP reliability
 		msg := encodeMessage(msgClip, n.id, encodeClipPayload(data))
-		for _, peer := range n.peers {
-			if err := sendUDP(peer, msg); err != nil {
-				n.logger.Printf("send to %s failed: %v", peer, err)
+		for attempt := 0; attempt < 3; attempt++ {
+			for _, peer := range n.peers {
+				if err := sendUDP(peer, msg); err != nil {
+					n.logger.Printf("send to %s failed: %v", peer, err)
+				}
+			}
+			if attempt < 2 {
+				time.Sleep(50 * time.Millisecond)
 			}
 		}
 		return

@@ -80,7 +80,7 @@ func testDirectSendReceive(t *testing.T) {
 		peerHashes: make(map[string]time.Time),
 		chunks:     make(map[string]*chunkBuffer),
 		stopCh:     make(chan struct{}),
-		lastRecvHash:   HashContent([]byte("initial")),
+		lastHash:   HashContent([]byte("initial")),
 	}
 
 	node2 := &Node{
@@ -92,7 +92,7 @@ func testDirectSendReceive(t *testing.T) {
 		peerHashes: make(map[string]time.Time),
 		chunks:     make(map[string]*chunkBuffer),
 		stopCh:     make(chan struct{}),
-		lastRecvHash:   HashContent([]byte("initial")),
+		lastHash:   HashContent([]byte("initial")),
 	}
 
 	// start listeners
@@ -121,7 +121,7 @@ func testDirectSendReceive(t *testing.T) {
 
 	// verify node2's lastHash updated
 	node2.mu.Lock()
-	if node2.lastRecvHash != HashContent(clipData) {
+	if node2.lastHash != HashContent(clipData) {
 		t.Error("node2 lastHash not updated")
 	}
 	node2.mu.Unlock()
@@ -175,7 +175,7 @@ func TestDuplicateSuppression(t *testing.T) {
 		peerHashes: make(map[string]time.Time),
 		chunks:     make(map[string]*chunkBuffer),
 		stopCh:     make(chan struct{}),
-		lastRecvHash:   HashContent([]byte("original")),
+		lastHash:   HashContent([]byte("original")),
 	}
 
 	node.wg.Add(1)
@@ -201,7 +201,7 @@ func TestDuplicateSuppression(t *testing.T) {
 	// manually change clipboard to something else
 	cb.Set("changed")
 	node.mu.Lock()
-	node.lastRecvHash = HashContent([]byte("changed"))
+	node.lastHash = HashContent([]byte("changed"))
 	node.mu.Unlock()
 
 	// second send with same data — hash is in peerHashes but lastHash changed,
@@ -301,7 +301,7 @@ func TestSelfMessageIgnored(t *testing.T) {
 		peerHashes: make(map[string]time.Time),
 		chunks:     make(map[string]*chunkBuffer),
 		stopCh:     make(chan struct{}),
-		lastRecvHash:   HashContent([]byte("original")),
+		lastHash:   HashContent([]byte("original")),
 	}
 
 	node.wg.Add(1)
@@ -351,7 +351,7 @@ func TestChunkedTransfer(t *testing.T) {
 		peerHashes: make(map[string]time.Time),
 		chunks:     make(map[string]*chunkBuffer),
 		stopCh:     make(chan struct{}),
-		lastRecvHash:   HashContent([]byte("original")),
+		lastHash:   HashContent([]byte("original")),
 	}
 
 	node.wg.Add(1)
@@ -414,7 +414,7 @@ func TestUTF8ClipboardSync(t *testing.T) {
 		peerHashes: make(map[string]time.Time),
 		chunks:     make(map[string]*chunkBuffer),
 		stopCh:     make(chan struct{}),
-		lastRecvHash:   HashContent([]byte("original")),
+		lastHash:   HashContent([]byte("original")),
 	}
 
 	node.wg.Add(1)
