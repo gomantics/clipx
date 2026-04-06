@@ -124,13 +124,15 @@ func (n *Node) sendToPeer(peer string, data []byte) error {
 	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	_, err := conn.Write(data)
 	if err != nil {
-		// reconnect and retry once
-		conn.Close()
-		delete(n.peerConns, peer)
-		n.connectPeer(peer)
-		if c, ok := n.peerConns[peer]; ok {
-			c.SetWriteDeadline(time.Now().Add(2 * time.Second))
-			_, err = c.Write(data)
+		// only reconnect on connection errors, not payload errors
+		if isConnectionError(err) {
+			conn.Close()
+			delete(n.peerConns, peer)
+			n.connectPeer(peer)
+			if c, ok := n.peerConns[peer]; ok {
+				c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+				_, err = c.Write(data)
+			}
 		}
 	}
 	return err
@@ -414,4 +416,13 @@ func isTimeout(err error) bool {
 		return true
 	}
 	return false
+}
+
+func isConnectionError(err error) bool {
+	s := err.Error()
+	// don't reconnect for payload issues like "message too long"
+	if strings.Contains(s, "message too long") {
+		return false
+	}
+	return true
 }

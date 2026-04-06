@@ -34,8 +34,10 @@ const chunkHeaderLen = hashLen + 2 + 2 // hash + index + total
 
 const (
 	// MaxChunkPayload is the max clipboard data per UDP packet.
-	// Keep under ~16KB to avoid UDP fragmentation issues on WiFi.
-	MaxChunkPayload = 16 * 1024
+	// Must stay under WiFi MTU (~1500) minus headers to avoid
+	// "message too long" on macOS which sets DF (Don't Fragment).
+	// 1500 MTU - 20 IP - 8 UDP - 15 clipx header - 68 chunk header = 1389
+	MaxChunkPayload = 1300 // safe margin under any MTU
 
 	// MaxClipSize is the absolute max clipboard size we'll sync.
 	MaxClipSize = 10 * 1024 * 1024 // 10MB
