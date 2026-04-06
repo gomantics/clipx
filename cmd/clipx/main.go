@@ -66,6 +66,9 @@ func main() {
 		case "help", "--help", "-h":
 			printUsage()
 			return
+		default:
+			fmt.Fprintf(os.Stderr, "unknown command: %s\nrun 'clipx help' for usage\n", os.Args[1])
+			os.Exit(1)
 		}
 	}
 
@@ -156,7 +159,7 @@ func cmdPair(addr string) {
 	}
 
 	fmt.Printf("✓ paired with %s\n", resolved)
-	fmt.Println("  restart clipx or run 'clipx install' to apply")
+	restartIfRunning()
 }
 
 func cmdUnpair(addr string) {
@@ -193,6 +196,7 @@ func cmdUnpair(addr string) {
 	}
 
 	fmt.Printf("✓ unpaired from %s\n", addr)
+	restartIfRunning()
 }
 
 func cmdPeers() {
@@ -213,7 +217,7 @@ func cmdPeers() {
 func cmdStatus() {
 	out, err := exec.Command("launchctl", "list", launchAgentLabel).Output()
 	if err != nil {
-		fmt.Println("● clipx is not running as a LaunchAgent")
+		fmt.Println("○ clipx is not running as a LaunchAgent")
 	} else {
 		fmt.Println("● clipx is running as a LaunchAgent")
 		fmt.Println(string(out))
@@ -237,33 +241,86 @@ func cmdStatus() {
 	}
 }
 
+// detectInstallMethod returns "brew", "go", or "binary" based on
+// where the current clipx binary lives.
+func detectInstallMethod() string {
+	exePath, err := os.Executable()
+	if err != nil {
+		return "binary"
+	}
+	exePath, _ = filepath.EvalSymlinks(exePath)
+
+	if strings.Contains(exePath, "Cellar") || strings.Contains(exePath, "homebrew") {
+		return "brew"
+	}
+
+	gopath := os.Getenv("GOPATH")
+	if gopath == "" {
+		home, _ := os.UserHomeDir()
+		gopath = filepath.Join(home, "go")
+	}
+	if strings.HasPrefix(exePath, filepath.Join(gopath, "bin")) {
+		return "go"
+	}
+
+	return "binary"
+}
+
 func cmdUpdate() {
 	current := getVersion()
 	fmt.Printf("current version: %s\n", current)
-	fmt.Println("updating via go install...")
 
-	cmd := exec.Command("go", "install", "github.com/gomantics/clipx/cmd/clipx@latest")
-	cmd.Env = append(os.Environ(),
-		"GONOSUMDB=github.com/gomantics/clipx",
-		"GONOSUMCHECK=github.com/gomantics/clipx",
-	)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "error: go install failed: %v\n", err)
+	method := detectInstallMethod()
+
+	switch method {
+	case "brew":
+		fmt.Println("installed via Homebrew, updating...")
+		cmd := exec.Command("brew", "upgrade", "clipx")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "error: brew upgrade failed: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "go":
+		fmt.Println("installed via go install, updating...")
+		cmd := exec.Command("go", "install", "github.com/gomantics/clipx/cmd/clipx@latest")
+		cmd.Env = append(os.Environ(),
+			"GONOSUMDB=github.com/gomantics/clipx",
+			"GONOSUMCHECK=github.com/gomantics/clipx",
+		)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "error: go install failed: %v\n", err)
+			os.Exit(1)
+		}
+
+	default:
+		fmt.Fprintln(os.Stderr, "cannot detect install method")
+		fmt.Fprintln(os.Stderr, "update manually from https://github.com/gomantics/clipx/releases")
 		os.Exit(1)
 	}
 
 	fmt.Println("✓ clipx updated")
+	restartIfRunning()
+}
 
+// restartIfRunning restarts the LaunchAgent if it's currently loaded.
+func restartIfRunning() {
 	plistPath := launchAgentPath()
-	if _, err := os.Stat(plistPath); err == nil {
-		fmt.Println("restarting LaunchAgent...")
-		exec.Command("launchctl", "unload", plistPath).Run()
-		time.Sleep(500 * time.Millisecond)
-		exec.Command("launchctl", "load", plistPath).Run()
-		fmt.Println("✓ LaunchAgent restarted")
+	if _, err := os.Stat(plistPath); err != nil {
+		return // not installed as LaunchAgent
 	}
+	if err := exec.Command("launchctl", "list", launchAgentLabel).Run(); err != nil {
+		return // not currently running
+	}
+	fmt.Println("restarting LaunchAgent...")
+	exec.Command("launchctl", "unload", plistPath).Run()
+	time.Sleep(500 * time.Millisecond)
+	exec.Command("launchctl", "load", plistPath).Run()
+	fmt.Println("✓ LaunchAgent restarted")
 }
 
 // --- LaunchAgent ---
@@ -316,9 +373,13 @@ func cmdInstall() {
 	fmt.Println("adding firewall exception (may require sudo password)...")
 	fwTool := "/usr/libexec/ApplicationFirewall/socketfilterfw"
 	if _, err := os.Stat(fwTool); err == nil {
-		exec.Command("sudo", fwTool, "--add", binPath).Run()
-		exec.Command("sudo", fwTool, "--unblockapp", binPath).Run()
-		fmt.Println("✓ firewall exception added")
+		err1 := exec.Command("sudo", fwTool, "--add", binPath).Run()
+		err2 := exec.Command("sudo", fwTool, "--unblockapp", binPath).Run()
+		if err1 != nil || err2 != nil {
+			fmt.Println("⚠ firewall exception failed — you may need to allow clipx manually")
+		} else {
+			fmt.Println("✓ firewall exception added")
+		}
 	}
 
 	plistPath := launchAgentPath()
