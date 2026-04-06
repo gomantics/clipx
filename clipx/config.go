@@ -7,8 +7,9 @@ import (
 )
 
 // Config holds persistent clipx configuration.
+// It is stored as JSON at ~/.config/clipx/config.json.
 type Config struct {
-	Peers []string `json:"peers"` // list of peer IPs/hostnames
+	Peers []string `json:"peers"` // IP addresses of paired peers
 }
 
 // ConfigPath returns the path to the config file.
