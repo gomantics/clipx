@@ -1,6 +1,7 @@
 package clipx
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -14,6 +15,7 @@ func TestEncodeDecodeMessage(t *testing.T) {
 		{"ping", msgPing, "abc12345", nil},
 		{"pong", msgPong, "xyz99999", nil},
 		{"clip", msgClip, "node0001", []byte("hello world")},
+		{"chunk", msgChunk, "node0002", []byte("chunk data")},
 		{"empty payload", msgPing, "short", nil},
 		{"short nodeID padded", msgClip, "ab", []byte("data")},
 	}
@@ -29,7 +31,6 @@ func TestEncodeDecodeMessage(t *testing.T) {
 			if gotType != tt.msgType {
 				t.Errorf("type: got %c, want %c", gotType, tt.msgType)
 			}
-			// nodeID is padded/truncated to 8 chars
 			wantID := tt.nodeID
 			if len(wantID) > 8 {
 				wantID = wantID[:8]
@@ -87,6 +88,38 @@ func TestClipPayloadTooShort(t *testing.T) {
 	}
 }
 
+func TestChunkPayloadRoundtrip(t *testing.T) {
+	data := []byte("chunk data here")
+	hash := HashContent([]byte("full content"))
+
+	payload := encodeChunkPayload(hash, 2, 5, data)
+
+	gotHash, gotIndex, gotTotal, gotData, err := decodeChunkPayload(payload)
+	if err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+
+	if gotHash != hash {
+		t.Errorf("hash: got %s, want %s", gotHash, hash)
+	}
+	if gotIndex != 2 {
+		t.Errorf("index: got %d, want 2", gotIndex)
+	}
+	if gotTotal != 5 {
+		t.Errorf("total: got %d, want 5", gotTotal)
+	}
+	if string(gotData) != string(data) {
+		t.Errorf("data: got %q, want %q", gotData, data)
+	}
+}
+
+func TestChunkPayloadTooShort(t *testing.T) {
+	_, _, _, _, err := decodeChunkPayload([]byte("short"))
+	if err == nil {
+		t.Fatal("expected error for short chunk payload")
+	}
+}
+
 func TestHashContent(t *testing.T) {
 	h1 := HashContent([]byte("hello"))
 	h2 := HashContent([]byte("hello"))
@@ -100,5 +133,33 @@ func TestHashContent(t *testing.T) {
 	}
 	if len(h1) != 64 {
 		t.Errorf("hash should be 64 hex chars, got %d", len(h1))
+	}
+}
+
+func TestHashContentUTF8(t *testing.T) {
+	// ensure non-ASCII (em-dash, emoji, etc.) hashes correctly
+	data := []byte("hello — world 🌍 über café")
+	h := HashContent(data)
+	if len(h) != 64 {
+		t.Errorf("hash should be 64 hex chars, got %d", len(h))
+	}
+	// same content = same hash
+	if h != HashContent(data) {
+		t.Error("same UTF-8 content should produce same hash")
+	}
+}
+
+func TestMaxChunkPayloadCoverage(t *testing.T) {
+	// content exactly at MaxChunkPayload should be single packet
+	data := strings.Repeat("x", MaxChunkPayload)
+	if len(data) > MaxChunkPayload {
+		t.Fatal("test setup wrong")
+	}
+
+	// content 1 byte over should need 2 chunks
+	data2 := strings.Repeat("x", MaxChunkPayload+1)
+	totalChunks := (len(data2) + MaxChunkPayload - 1) / MaxChunkPayload
+	if totalChunks != 2 {
+		t.Errorf("expected 2 chunks, got %d", totalChunks)
 	}
 }

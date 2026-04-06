@@ -2,6 +2,7 @@ package clipx
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -9,20 +10,36 @@ import (
 
 // Message types
 const (
-	msgClip = byte('C') // clipboard data
-	msgPing = byte('P') // ping
-	msgPong = byte('A') // pong (ack)
+	msgClip  = byte('C') // clipboard data (single packet, <=32KB payload)
+	msgChunk = byte('K') // clipboard chunk (for large content)
+	msgPing  = byte('P') // ping
+	msgPong  = byte('A') // pong (ack)
 )
 
 // Wire format:
 //   [6 bytes magic "CLIPX2"] [1 byte type] [8 bytes nodeID] [payload...]
 //
-// Clipboard payload: [64 bytes sha256 hex] [data...]
+// Clipboard payload (msgClip):
+//   [64 bytes sha256 hex] [data...]
+//
+// Chunk payload (msgChunk):
+//   [64 bytes sha256 hex] [2 bytes chunkIndex BE] [2 bytes totalChunks BE] [data...]
+//
 // Ping/Pong payload: (empty)
 
 const magic = "CLIPX2"
 const headerLen = 6 + 1 + 8 // magic + type + nodeID
 const hashLen = 64
+const chunkHeaderLen = hashLen + 2 + 2 // hash + index + total
+
+const (
+	// MaxChunkPayload is the max clipboard data per UDP packet.
+	// Keep under ~16KB to avoid UDP fragmentation issues on WiFi.
+	MaxChunkPayload = 16 * 1024
+
+	// MaxClipSize is the absolute max clipboard size we'll sync.
+	MaxClipSize = 10 * 1024 * 1024 // 10MB
+)
 
 // encodeMessage builds a wire message.
 func encodeMessage(msgType byte, nodeID string, payload []byte) []byte {
@@ -49,7 +66,7 @@ func decodeMessage(data []byte) (byte, string, []byte, error) {
 	return msgType, nodeID, payload, nil
 }
 
-// encodeClipPayload builds the payload for a clipboard message.
+// encodeClipPayload builds the payload for a single-packet clipboard message.
 func encodeClipPayload(data []byte) []byte {
 	hash := HashContent(data)
 	payload := make([]byte, 0, hashLen+len(data))
@@ -64,6 +81,28 @@ func decodeClipPayload(payload []byte) (hash string, data []byte, err error) {
 		return "", nil, errors.New("clip payload too short")
 	}
 	return string(payload[:hashLen]), payload[hashLen:], nil
+}
+
+// encodeChunkPayload builds the payload for a chunk message.
+func encodeChunkPayload(hash string, index, total uint16, data []byte) []byte {
+	payload := make([]byte, 0, chunkHeaderLen+len(data))
+	payload = append(payload, []byte(hash)...)
+	payload = binary.BigEndian.AppendUint16(payload, index)
+	payload = binary.BigEndian.AppendUint16(payload, total)
+	payload = append(payload, data...)
+	return payload
+}
+
+// decodeChunkPayload parses the payload of a chunk message.
+func decodeChunkPayload(payload []byte) (hash string, index, total uint16, data []byte, err error) {
+	if len(payload) < chunkHeaderLen {
+		return "", 0, 0, nil, errors.New("chunk payload too short")
+	}
+	hash = string(payload[:hashLen])
+	index = binary.BigEndian.Uint16(payload[hashLen : hashLen+2])
+	total = binary.BigEndian.Uint16(payload[hashLen+2 : hashLen+4])
+	data = payload[chunkHeaderLen:]
+	return hash, index, total, data, nil
 }
 
 // HashContent returns the SHA-256 hex hash of data.

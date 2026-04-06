@@ -12,7 +12,6 @@ import (
 )
 
 const (
-	maxClipSize  = 64 * 1024 // 64KB safe for UDP on LAN
 	pollInterval = 500 * time.Millisecond
 )
 
@@ -24,15 +23,29 @@ type Node struct {
 	logger    *log.Logger
 	conn      net.PacketConn
 
-	mu       sync.Mutex
-	lastHash string
+	mu           sync.Mutex
+	lastRecvHash string // last hash received from peer (for anti-loop)
+	lastSentHash string // last hash we sent (to avoid resending same content every poll)
+	lastSentAt   time.Time
 
 	// hashes received from peers — prevents re-broadcasting
 	peerHashes   map[string]time.Time
 	peerHashesMu sync.Mutex
 
+	// chunk reassembly buffers
+	chunks   map[string]*chunkBuffer
+	chunksMu sync.Mutex
+
 	stopCh chan struct{}
 	wg     sync.WaitGroup
+}
+
+// chunkBuffer collects chunks for a single transfer.
+type chunkBuffer struct {
+	hash      string
+	total     int
+	received  map[int][]byte
+	createdAt time.Time
 }
 
 // NewNode creates a new clipx node.
@@ -54,23 +67,26 @@ func NewNodeWithClipboard(cfg *Config, logger *log.Logger, cb Clipboard) (*Node,
 		logger:     logger,
 		conn:       conn,
 		peerHashes: make(map[string]time.Time),
+		chunks:     make(map[string]*chunkBuffer),
 		stopCh:     make(chan struct{}),
 	}
 
-	// initialize hash with current clipboard
+	// initialize with current clipboard
 	if content, err := cb.Read(); err == nil && len(content) > 0 {
-		n.lastHash = HashContent(content)
+		h := HashContent(content)
+		n.lastRecvHash = h
+		n.lastSentHash = h
 	}
 
 	return n, nil
 }
 
-// Start begins the listener, clipboard watcher, and heartbeat.
+// Start begins the listener, clipboard watcher, and maintenance.
 func (n *Node) Start() {
 	n.wg.Add(3)
 	go n.listen()
 	go n.watchClipboard()
-	go n.heartbeat()
+	go n.maintenance()
 }
 
 // Stop shuts down the node.
@@ -84,7 +100,11 @@ func (n *Node) Stop() {
 
 func (n *Node) listen() {
 	defer n.wg.Done()
-	buf := make([]byte, 70*1024) // 64KB + header room
+	// set receive buffer large enough for max chunk + headers
+	if udpConn, ok := n.conn.(*net.UDPConn); ok {
+		udpConn.SetReadBuffer(256 * 1024)
+	}
+	buf := make([]byte, 40*1024) // 32KB payload + headers
 
 	for {
 		n.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -107,23 +127,23 @@ func (n *Node) listen() {
 		}
 
 		senderID = strings.TrimSpace(senderID)
-
-		// ignore our own messages (shouldn't happen with unicast, but safe)
 		if senderID == n.id {
 			continue
 		}
 
 		switch msgType {
 		case msgPing:
-			// respond with pong
 			pong := encodeMessage(msgPong, n.id, nil)
 			n.conn.WriteTo(pong, remoteAddr)
 
 		case msgPong:
-			// handled by PingPeer directly
+			// handled by PingPeer
 
 		case msgClip:
 			n.handleClip(senderID, payload)
+
+		case msgChunk:
+			n.handleChunk(senderID, payload)
 		}
 	}
 }
@@ -133,16 +153,70 @@ func (n *Node) handleClip(senderID string, payload []byte) {
 	if err != nil {
 		return
 	}
+	n.applyClipboard(senderID, hash, data)
+}
 
+func (n *Node) handleChunk(senderID string, payload []byte) {
+	hash, index, total, data, err := decodeChunkPayload(payload)
+	if err != nil {
+		return
+	}
+
+	n.chunksMu.Lock()
+	buf, exists := n.chunks[hash]
+	if !exists {
+		buf = &chunkBuffer{
+			hash:      hash,
+			total:     int(total),
+			received:  make(map[int][]byte),
+			createdAt: time.Now(),
+		}
+		n.chunks[hash] = buf
+	}
+
+	// store this chunk
+	chunk := make([]byte, len(data))
+	copy(chunk, data)
+	buf.received[int(index)] = chunk
+
+	// check if complete
+	if len(buf.received) < buf.total {
+		n.chunksMu.Unlock()
+		return
+	}
+
+	// reassemble
+	var assembled []byte
+	for i := 0; i < buf.total; i++ {
+		c, ok := buf.received[i]
+		if !ok {
+			n.chunksMu.Unlock()
+			return // missing chunk
+		}
+		assembled = append(assembled, c...)
+	}
+	delete(n.chunks, hash)
+	n.chunksMu.Unlock()
+
+	// verify hash
+	if HashContent(assembled) != hash {
+		n.logger.Printf("chunk reassembly hash mismatch from %s", senderID)
+		return
+	}
+
+	n.applyClipboard(senderID, hash, assembled)
+}
+
+func (n *Node) applyClipboard(senderID, hash string, data []byte) {
 	n.mu.Lock()
-	if hash == n.lastHash {
+	if hash == n.lastRecvHash {
 		n.mu.Unlock()
 		return
 	}
-	n.lastHash = hash
+	n.lastRecvHash = hash
+	n.lastSentHash = hash // also set sent hash so we don't echo it back
 	n.mu.Unlock()
 
-	// remember peer hash to avoid re-broadcasting
 	n.peerHashesMu.Lock()
 	n.peerHashes[hash] = time.Now()
 	n.peerHashesMu.Unlock()
@@ -169,27 +243,28 @@ func (n *Node) watchClipboard() {
 		}
 
 		data, err := n.clipboard.Read()
-		if err != nil || len(data) == 0 || len(data) > maxClipSize {
+		if err != nil || len(data) == 0 || len(data) > MaxClipSize {
 			continue
 		}
 
 		hash := HashContent(data)
 
-		n.mu.Lock()
-		if hash == n.lastHash {
-			n.mu.Unlock()
-			continue
-		}
-		n.lastHash = hash
-		n.mu.Unlock()
-
-		// skip if this came from a peer
+		// skip if this content was just received from a peer (anti-loop)
 		n.peerHashesMu.Lock()
 		if _, fromPeer := n.peerHashes[hash]; fromPeer {
 			n.peerHashesMu.Unlock()
 			continue
 		}
 		n.peerHashesMu.Unlock()
+
+		// skip if same as what we last sent AND sent recently (< 5s)
+		// after 5s, allow re-send of same content (retry for UDP drops)
+		n.mu.Lock()
+		if hash == n.lastSentHash && time.Since(n.lastSentAt) < 5*time.Second {
+			n.mu.Unlock()
+			continue
+		}
+		n.mu.Unlock()
 
 		if len(n.peers) == 0 {
 			continue
@@ -198,18 +273,63 @@ func (n *Node) watchClipboard() {
 		preview := clipPreview(data)
 		n.logger.Printf("→ sending to %d peer(s) (%d bytes): %s", len(n.peers), len(data), preview)
 
+		n.sendToAllPeers(data)
+	}
+}
+
+func (n *Node) sendToAllPeers(data []byte) {
+	hash := HashContent(data)
+
+	// record that we sent this
+	n.mu.Lock()
+	n.lastSentHash = hash
+	n.lastSentAt = time.Now()
+	n.mu.Unlock()
+
+	if len(data) <= MaxChunkPayload {
+		// single packet
 		msg := encodeMessage(msgClip, n.id, encodeClipPayload(data))
 		for _, peer := range n.peers {
 			if err := sendUDP(peer, msg); err != nil {
 				n.logger.Printf("send to %s failed: %v", peer, err)
 			}
 		}
+		return
+	}
+
+	// chunked transfer
+	totalChunks := (len(data) + MaxChunkPayload - 1) / MaxChunkPayload
+	if totalChunks > 65535 {
+		n.logger.Printf("content too large to chunk (%d bytes)", len(data))
+		return
+	}
+
+	for i := 0; i < totalChunks; i++ {
+		start := i * MaxChunkPayload
+		end := start + MaxChunkPayload
+		if end > len(data) {
+			end = len(data)
+		}
+		chunk := data[start:end]
+		payload := encodeChunkPayload(hash, uint16(i), uint16(totalChunks), chunk)
+		msg := encodeMessage(msgChunk, n.id, payload)
+
+		for _, peer := range n.peers {
+			if err := sendUDP(peer, msg); err != nil {
+				n.logger.Printf("send chunk %d/%d to %s failed: %v", i+1, totalChunks, peer, err)
+			}
+		}
+
+		// small delay between chunks to avoid overwhelming the receiver
+		if i < totalChunks-1 {
+			time.Sleep(1 * time.Millisecond)
+		}
 	}
 }
 
-// --- Heartbeat (peer hash cleanup) ---
+// --- Maintenance ---
 
-func (n *Node) heartbeat() {
+func (n *Node) maintenance() {
 	defer n.wg.Done()
 
 	for {
@@ -219,6 +339,7 @@ func (n *Node) heartbeat() {
 		case <-time.After(15 * time.Second):
 		}
 
+		// cleanup old peer hashes
 		n.peerHashesMu.Lock()
 		for h, t := range n.peerHashes {
 			if time.Since(t) > 60*time.Second {
@@ -226,6 +347,16 @@ func (n *Node) heartbeat() {
 			}
 		}
 		n.peerHashesMu.Unlock()
+
+		// cleanup stale chunk buffers (incomplete transfers)
+		n.chunksMu.Lock()
+		for hash, buf := range n.chunks {
+			if time.Since(buf.createdAt) > 30*time.Second {
+				n.logger.Printf("discarding incomplete transfer %s (%d/%d chunks)", hash[:8], len(buf.received), buf.total)
+				delete(n.chunks, hash)
+			}
+		}
+		n.chunksMu.Unlock()
 	}
 }
 

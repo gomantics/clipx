@@ -19,7 +19,7 @@ Each Mac runs `clipx`. When you copy something, it sends the clipboard content d
 - **UDP unicast** — reliable, fast, no firewall issues with multicast
 - **Explicit pairing** — `clipx pair <ip>`, no flaky auto-discovery
 - **SHA-256 dedup** — prevents infinite ping-pong loops between nodes
-- **64KB max** — covers all text clipboard content comfortably
+- **10MB max** — large content is automatically chunked into 16KB UDP packets
 
 ## Setup
 
@@ -164,7 +164,7 @@ Clipboard payload: `[64B SHA-256 hex hash] [clipboard data]`
 
 ### Limits
 
-- Max clipboard: **64KB** (larger content silently skipped)
+- Max clipboard: **10MB** (content >16KB is automatically chunked)
 - Text only (uses `pbcopy`/`pbpaste`)
 - macOS only (for now)
 - Peers must be on the same LAN

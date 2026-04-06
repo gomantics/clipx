@@ -1,8 +1,8 @@
 package clipx
 
 import (
+	"bytes"
 	"os/exec"
-	"strings"
 )
 
 // Clipboard abstracts clipboard read/write for testability.
@@ -21,6 +21,6 @@ func (c *MacClipboard) Read() ([]byte, error) {
 
 func (c *MacClipboard) Write(data []byte) error {
 	cmd := exec.Command("pbcopy")
-	cmd.Stdin = strings.NewReader(string(data))
+	cmd.Stdin = bytes.NewReader(data)
 	return cmd.Run()
 }

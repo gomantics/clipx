@@ -78,8 +78,9 @@ func testDirectSendReceive(t *testing.T) {
 		logger:     logger,
 		conn:       conn1,
 		peerHashes: make(map[string]time.Time),
+		chunks:     make(map[string]*chunkBuffer),
 		stopCh:     make(chan struct{}),
-		lastHash:   HashContent([]byte("initial")),
+		lastRecvHash:   HashContent([]byte("initial")),
 	}
 
 	node2 := &Node{
@@ -89,8 +90,9 @@ func testDirectSendReceive(t *testing.T) {
 		logger:     logger,
 		conn:       conn2,
 		peerHashes: make(map[string]time.Time),
+		chunks:     make(map[string]*chunkBuffer),
 		stopCh:     make(chan struct{}),
-		lastHash:   HashContent([]byte("initial")),
+		lastRecvHash:   HashContent([]byte("initial")),
 	}
 
 	// start listeners
@@ -119,7 +121,7 @@ func testDirectSendReceive(t *testing.T) {
 
 	// verify node2's lastHash updated
 	node2.mu.Lock()
-	if node2.lastHash != HashContent(clipData) {
+	if node2.lastRecvHash != HashContent(clipData) {
 		t.Error("node2 lastHash not updated")
 	}
 	node2.mu.Unlock()
@@ -171,8 +173,9 @@ func TestDuplicateSuppression(t *testing.T) {
 		logger:     logger,
 		conn:       conn,
 		peerHashes: make(map[string]time.Time),
+		chunks:     make(map[string]*chunkBuffer),
 		stopCh:     make(chan struct{}),
-		lastHash:   HashContent([]byte("original")),
+		lastRecvHash:   HashContent([]byte("original")),
 	}
 
 	node.wg.Add(1)
@@ -198,7 +201,7 @@ func TestDuplicateSuppression(t *testing.T) {
 	// manually change clipboard to something else
 	cb.Set("changed")
 	node.mu.Lock()
-	node.lastHash = HashContent([]byte("changed"))
+	node.lastRecvHash = HashContent([]byte("changed"))
 	node.mu.Unlock()
 
 	// second send with same data — hash is in peerHashes but lastHash changed,
@@ -240,6 +243,7 @@ func TestPingPong(t *testing.T) {
 		logger:     logger,
 		conn:       conn,
 		peerHashes: make(map[string]time.Time),
+		chunks:     make(map[string]*chunkBuffer),
 		stopCh:     make(chan struct{}),
 	}
 
@@ -295,8 +299,9 @@ func TestSelfMessageIgnored(t *testing.T) {
 		logger:     logger,
 		conn:       conn,
 		peerHashes: make(map[string]time.Time),
+		chunks:     make(map[string]*chunkBuffer),
 		stopCh:     make(chan struct{}),
-		lastHash:   HashContent([]byte("original")),
+		lastRecvHash:   HashContent([]byte("original")),
 	}
 
 	node.wg.Add(1)
@@ -314,6 +319,118 @@ func TestSelfMessageIgnored(t *testing.T) {
 
 	if cb.Get() != "original" {
 		t.Errorf("self message should be ignored, clipboard changed to %q", cb.Get())
+	}
+
+	close(node.stopCh)
+	conn.Close()
+	node.wg.Wait()
+}
+
+func TestChunkedTransfer(t *testing.T) {
+	// use 3x 1KB chunks to avoid OS UDP buffer issues in tests
+	chunkSize := 1024
+	bigContent := []byte(strings.Repeat("abcdefghij", (chunkSize*3)/10))
+	if len(bigContent) <= chunkSize {
+		t.Fatal("test content should be larger than chunkSize")
+	}
+
+	cb := &mockClipboard{data: []byte("original")}
+	logger := newTestLogger(t)
+
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+
+	node := &Node{
+		id:         "receiver",
+		clipboard:  cb,
+		logger:     logger,
+		conn:       conn,
+		peerHashes: make(map[string]time.Time),
+		chunks:     make(map[string]*chunkBuffer),
+		stopCh:     make(chan struct{}),
+		lastRecvHash:   HashContent([]byte("original")),
+	}
+
+	node.wg.Add(1)
+	go node.listen()
+	time.Sleep(100 * time.Millisecond)
+
+	hash := HashContent(bigContent)
+	totalChunks := (len(bigContent) + chunkSize - 1) / chunkSize
+
+	sender, _ := net.ListenPacket("udp4", "127.0.0.1:0")
+	defer sender.Close()
+
+	for i := 0; i < totalChunks; i++ {
+		start := i * chunkSize
+		end := start + chunkSize
+		if end > len(bigContent) {
+			end = len(bigContent)
+		}
+		payload := encodeChunkPayload(hash, uint16(i), uint16(totalChunks), bigContent[start:end])
+		msg := encodeMessage(msgChunk, "sender01", payload)
+		sender.WriteTo(msg, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port})
+		time.Sleep(1 * time.Millisecond)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	got := cb.Get()
+	if got != string(bigContent) {
+		t.Errorf("chunked transfer: got %d bytes, want %d bytes", len(got), len(bigContent))
+	}
+
+	node.chunksMu.Lock()
+	if len(node.chunks) != 0 {
+		t.Errorf("chunk buffer should be empty, got %d", len(node.chunks))
+	}
+	node.chunksMu.Unlock()
+
+	close(node.stopCh)
+	conn.Close()
+	node.wg.Wait()
+}
+
+func TestUTF8ClipboardSync(t *testing.T) {
+	utf8Content := []byte("hello \u2014 world \U0001f30d \u00fcber caf\u00e9 na\u00efve r\u00e9sum\u00e9")
+
+	cb := &mockClipboard{data: []byte("original")}
+	logger := newTestLogger(t)
+
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+
+	node := &Node{
+		id:         "utf8node",
+		clipboard:  cb,
+		logger:     logger,
+		conn:       conn,
+		peerHashes: make(map[string]time.Time),
+		chunks:     make(map[string]*chunkBuffer),
+		stopCh:     make(chan struct{}),
+		lastRecvHash:   HashContent([]byte("original")),
+	}
+
+	node.wg.Add(1)
+	go node.listen()
+	time.Sleep(100 * time.Millisecond)
+
+	msg := encodeMessage(msgClip, "sender01", encodeClipPayload(utf8Content))
+	sender, _ := net.ListenPacket("udp4", "127.0.0.1:0")
+	defer sender.Close()
+	sender.WriteTo(msg, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port})
+
+	time.Sleep(300 * time.Millisecond)
+
+	got := cb.Get()
+	if got != string(utf8Content) {
+		t.Errorf("UTF-8 corrupted:\ngot:  %q\nwant: %q", got, string(utf8Content))
 	}
 
 	close(node.stopCh)
