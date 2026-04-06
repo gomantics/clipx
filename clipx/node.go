@@ -11,9 +11,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const (
-	pollInterval = 500 * time.Millisecond
-)
+const pollInterval = 500 * time.Millisecond
 
 // Node is a clipx daemon instance that watches the local clipboard,
 // broadcasts changes to peers, and applies incoming clipboard content.
